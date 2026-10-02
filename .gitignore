@@ -13,3 +13,6 @@ __pycache__/
 .yarn-cache/
 *.pyc
 *.pyo
+
+# durable frozen-audit log (bind-mounted at runtime)
+data/

@@ -536,8 +536,29 @@ function loadPreset(name) {
 document.querySelectorAll("button[data-preset]").forEach(b =>
   b.onclick = () => loadPreset(b.dataset.preset));
 
-/* 初始载入可串行化预设 */
+/* ------------------------------------------------------------------ */
+/* 重新打开审查页：按当前标识取回重启后恢复的冻结结论（静默，未冻结则保留提示） */
+/* ------------------------------------------------------------------ */
+async function restoreReopenedAudit() {
+  const id = encodeURIComponent(document.getElementById("auditId").value.trim());
+  if (!id) return;
+  let resp;
+  try {
+    resp = await fetch(`/api/audits/${id}`);
+  } catch (_) {
+    return;
+  }
+  if (!resp.ok) return;  // 404：该标识尚未冻结，保留草稿提示
+  const body = await resp.json();
+  rawJsonEl.textContent = `REQUEST GET /api/audits/${id}\n\nRESPONSE ${resp.status}（服务重启后重放恢复）\n`
+    + JSON.stringify(body, null, 2);
+  replayBadge.style.display = "inline-block";
+  renderVerdict(body);
+}
+
+/* 初始载入可串行化预设；若该标识已有服务端冻结记录（如服务重启后），直接展示恢复结论 */
 loadPreset("serial");
+restoreReopenedAudit();
 </script>
 </body>
 </html>

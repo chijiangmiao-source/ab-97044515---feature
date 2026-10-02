@@ -11,3 +11,6 @@ __pycache__
 .ruff_cache
 .tox
 .nox
+
+# durable frozen-audit log lives in the bind-mounted data/ volume
+data/

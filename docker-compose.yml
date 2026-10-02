@@ -7,6 +7,13 @@ services:
     container_name: mvscc-web
     environment:
       PORT: "8080"
+      # Frozen audit records are fsynced here and replayed on start-up.
+      # The directory is bind-mounted so conclusions survive restarts and
+      # host power loss; the one-shot verify service inspects it over the
+      # same bind mount (./:/workspace -> /workspace/data).
+      AUDIT_LOG: "/app/data/audit.log"
+    volumes:
+      - ./data:/app/data
     ports:
       # 宿主机端口可通过 HOST_PORT 配置（见 .env.example），默认 8080
       - "${HOST_PORT:-8080}:8080"
@@ -20,7 +27,8 @@ services:
       start_period: 3s
     restart: unless-stopped
 
-  # 单次验收服务：代码测试 -> 镜像构建检查 -> HTTP 冒烟，随后退出。
+  # 单次验收服务：代码测试 -> 差分模糊 -> 镜像构建检查 -> HTTP 冒烟 ->
+  # 经 Engine API 重启 web 的耐久性验收，随后退出。
   # 以退出码报告验收结果：
   #   docker compose up --abort-on-container-exit --exit-code-from verify
   #   docker compose run --rm verify ; echo $?

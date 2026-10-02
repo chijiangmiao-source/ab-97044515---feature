@@ -20,9 +20,10 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mvscc import PayloadError, build_analysis  # noqa: E402
-from store import ConflictError, FrozenStore  # noqa: E402
+from store import ConflictError, FrozenStore, RecordIntegrityError  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+DEFAULT_LOG = Path(__file__).resolve().parent.parent / "data" / "audit.log"
 
 
 class AuditHandler(BaseHTTPRequestHandler):
@@ -50,19 +51,48 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _require_healthy_log(self) -> bool:
+        """Send 503 and return False when the replayed log failed verification."""
+        if self.server.store.healthy:
+            return True
+        self._send_json(
+            503,
+            {
+                "error": "AUDIT_LOG_CORRUPT",
+                "message": self.server.store.health_error
+                or "the frozen audit log failed verification on replay",
+            },
+        )
+        return False
+
     # ------------------------------------------------------------------
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/healthz":
-            self._send_json(200, {"status": "ok"})
+            if self.server.store.healthy:
+                self._send_json(200, {"status": "ok"})
+            else:
+                self._send_json(
+                    503,
+                    {
+                        "status": "unhealthy",
+                        "error": "AUDIT_LOG_CORRUPT",
+                        "message": self.server.store.health_error
+                        or "the frozen audit log failed verification on replay",
+                    },
+                )
             return
         if path == "/api/audits":
+            if not self._require_healthy_log():
+                return
             self._send_json(200, {"audit_ids": self.server.store.ids()})
             return
         if path.startswith("/api/audits/"):
             audit_id = path[len("/api/audits/") :]
             if "/" in audit_id or not audit_id:
                 self._send_json(404, {"error": "NOT_FOUND"})
+                return
+            if not self._require_healthy_log():
                 return
             record = self.server.store.get(audit_id)
             if record is None:
@@ -137,6 +167,33 @@ class AuditHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        except RecordIntegrityError as exc:
+            sys.stderr.write("audit log integrity failure: %r\n" % (exc,))
+            self._send_json(
+                503,
+                {
+                    "error": "AUDIT_LOG_INTEGRITY",
+                    "message": (
+                        "the frozen audit log failed verification; "
+                        "the freeze was not acknowledged"
+                    ),
+                    "detail": str(exc),
+                },
+            )
+            return
+        except OSError as exc:
+            # The durable write did not complete: the record is not in the
+            # index and success is never returned, so the caller may retry.
+            sys.stderr.write("audit log write failure: %r\n" % (exc,))
+            self._send_json(
+                500,
+                {
+                    "error": "AUDIT_LOG_WRITE_FAILED",
+                    "message": "could not persist the frozen record; it was not acknowledged",
+                    "detail": str(exc),
+                },
+            )
+            return
 
         self._send_json(
             200 if replayed else 201,
@@ -145,9 +202,9 @@ class AuditHandler(BaseHTTPRequestHandler):
         )
 
 
-def make_server(host: str, port: int) -> ThreadingHTTPServer:
+def make_server(host: str, port: int, log_path: str | os.PathLike | None = None) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), AuditHandler)
-    server.store = FrozenStore()
+    server.store = FrozenStore(log_path)
     return server
 
 
@@ -157,7 +214,22 @@ def main(argv=None) -> int:
     port = int(os.environ.get("PORT", "8080"))
     if argv:
         port = int(argv[0])
-    server = make_server(host, port)
+    # Durable by default: frozen records live next to the service (or at
+    # AUDIT_LOG) so a restart / power loss replays them.  Set AUDIT_LOG to
+    # an empty string to force the in-memory store.
+    log_env = os.environ.get("AUDIT_LOG")
+    log_path = DEFAULT_LOG if log_env is None else (log_env or None)
+    server = make_server(host, port, log_path)
+    if server.store.healthy:
+        if log_path is not None:
+            sys.stderr.write(
+                "replayed %d frozen audit record(s) from %s\n"
+                % (len(server.store.ids()), log_path)
+            )
+    else:
+        sys.stderr.write(
+            "AUDIT LOG UNHEALTHY: %s\n" % (server.store.health_error,)
+        )
     sys.stderr.write("mvscc audit listening on http://%s:%d\n" % (host, port))
     try:
         server.serve_forever()
