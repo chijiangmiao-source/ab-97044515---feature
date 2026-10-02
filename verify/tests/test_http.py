@@ -1,7 +1,10 @@
 """End-to-end HTTP tests against the real server (in-process, ephemeral port)."""
 
 import json
+import os
+import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -50,7 +53,9 @@ def base_payload(audit_id="http-case", stale=False, skew=False, serial=True):
 
 class HttpServerTestBase(unittest.TestCase):
     def setUp(self):
-        self.server: ThreadingHTTPServer = make_server("127.0.0.1", 0)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.journal = os.path.join(self.tmp.name, "frozen.journal")
+        self.server: ThreadingHTTPServer = make_server("127.0.0.1", 0, self.journal)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -58,7 +63,9 @@ class HttpServerTestBase(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown()
         self.thread.join(timeout=5)
+        self.server.store.close()
         self.server.server_close()
+        self.tmp.cleanup()
 
     def request(self, method, path, body=None, expect_error=False):
         url = f"http://127.0.0.1:{self.port}{path}"
@@ -79,7 +86,8 @@ class HttpApiTests(HttpServerTestBase):
     def test_healthz(self):
         status, _, body = self.request("GET", "/healthz")
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"status": "ok"})
+        self.assertEqual(body["status"], "ok")
+        self.assertIn("journal", body)
 
     def test_console_page_served(self):
         url = f"http://127.0.0.1:{self.port}/"
@@ -185,6 +193,160 @@ class HttpApiTests(HttpServerTestBase):
         status, _, body = self.request("GET", "/api/audits/no-such", expect_error=True)
         self.assertEqual(status, 404)
         self.assertEqual(body["error"], "AUDIT_NOT_FOUND")
+
+
+class DurableRestartRecoveryTests(HttpServerTestBase):
+    """Simulate a service restart by pointing a fresh server at the journal."""
+
+    def _restart(self):
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.store.close()
+        self.server.server_close()
+        self.server = make_server("127.0.0.1", 0, self.journal)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        # wait for the new socket to answer
+        for _ in range(50):
+            try:
+                self.request("GET", "/healthz")
+                break
+            except (urllib.error.URLError, ConnectionError):
+                time.sleep(0.05)
+
+    def test_conclusion_survives_restart_and_replays_identically(self):
+        payload = base_payload(audit_id="durable-serial")
+        status, headers, first = self.request("POST", "/api/audits", payload)
+        self.assertEqual(status, 201)
+        self.assertEqual(headers.get("X-Audit-Replayed"), "false")
+
+        skew = base_payload(audit_id="durable-skew", skew=True)
+        status, _, skew_first = self.request("POST", "/api/audits", skew)
+        self.assertEqual(status, 201)
+        self.assertEqual(skew_first["status"], "NOT_SERIALIZABLE")
+
+        self._restart()
+
+        status, _, body = self.request("GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["journal"]["records"], 2)
+        self.assertEqual(body["journal"]["replayed"], 2)
+
+        # recovered serial-order conclusion is byte-identical
+        status, headers, body = self.request("POST", "/api/audits", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("X-Audit-Replayed"), "true")
+        self.assertEqual(body, first)
+
+        # recovered cycle conclusion is byte-identical too
+        status, _, body = self.request("POST", "/api/audits", skew)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, skew_first)
+
+        # same id + changed payload still conflicts after the restart
+        changed = json.loads(json.dumps(payload))
+        changed["initial"]["x"] = 4242
+        status, _, body = self.request("POST", "/api/audits", changed, expect_error=True)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "AUDIT_ID_CONFLICT")
+
+        # GET by id and the listing reflect recovered records
+        status, _, body = self.request("GET", "/api/audits/durable-serial")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, first)
+        status, _, body = self.request("GET", "/api/audits")
+        self.assertEqual(set(body["audit_ids"]), {"durable-serial", "durable-skew"})
+
+    def test_concurrent_identical_posts_after_restart_freeze_once(self):
+        payload = base_payload(audit_id="durable-race")
+        status, _, _ = self.request("POST", "/api/audits", payload)
+        self.assertEqual(status, 201)
+        self._restart()
+
+        results = []
+        lock = threading.Lock()
+
+        def post():
+            try:
+                # bypass the helper: plain urllib POST from N threads
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{self.port}/api/audits",
+                    data=json.dumps(payload).encode(), method="POST")
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    with lock:
+                        results.append(resp.status)
+            except urllib.error.HTTPError as exc:  # pragma: no cover
+                with lock:
+                    results.append(exc.code)
+
+        threads = [threading.Thread(target=post) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # every request is a replay of the single recovered freeze
+        self.assertEqual(results, [200] * 6)
+        # exactly one frame exists on disk for this id
+        with open(self.journal, "rb") as fh:
+            self.assertEqual(fh.read().count(b"F1\n"), 1)
+
+    def test_torn_tail_on_disk_is_invisible_then_service_healthy(self):
+        payload = base_payload(audit_id="durable-good")
+        self.request("POST", "/api/audits", payload)
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.store.close()
+        self.server.server_close()
+
+        # power loss mid-write: dangling bytes with no END marker
+        with open(self.journal, "ab") as fh:
+            fh.write(b"F1\nLEN 120\n{\"audit_id\": \"half-written\"")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        self.server = make_server("127.0.0.1", 0, self.journal)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+        status, _, body = self.request("GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["journal"]["torn_tail_discarded"])
+        status, _, _ = self.request("GET", "/api/audits/half-written", expect_error=True)
+        self.assertEqual(status, 404)
+        status, _, body = self.request("GET", "/api/audits/durable-good")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "SERIALIZABLE")
+
+    def test_corrupted_committed_record_makes_health_fail(self):
+        payload = base_payload(audit_id="durable-corrupt")
+        self.request("POST", "/api/audits", payload)
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.store.close()
+        self.server.server_close()
+
+        with open(self.journal, "rb") as fh:
+            blob = fh.read()
+        # flip a byte inside the JSON body but keep the trailing END marker,
+        # i.e. damage a fully committed record rather than tear a write
+        body_idx = blob.find(b"{")
+        corrupted = blob[:body_idx + 5] + b"%" + blob[body_idx + 6:]
+        with open(self.journal, "wb") as fh:
+            fh.write(corrupted)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        self.server = make_server("127.0.0.1", 0, self.journal)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+        status, _, body = self.request("GET", "/healthz", expect_error=True)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "JOURNAL_CORRUPT")
 
 
 if __name__ == "__main__":

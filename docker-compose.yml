@@ -7,6 +7,10 @@ services:
     container_name: mvscc-web
     environment:
       PORT: "8080"
+      AUDIT_JOURNAL_PATH: "/data/frozen.journal"
+    volumes:
+      # 冻结审计记录的校验日志：服务重启 / 异常断电后据此重放恢复
+      - audit-data:/data
     ports:
       # 宿主机端口可通过 HOST_PORT 配置（见 .env.example），默认 8080
       - "${HOST_PORT:-8080}:8080"
@@ -20,8 +24,9 @@ services:
       start_period: 3s
     restart: unless-stopped
 
-  # 单次验收服务：代码测试 -> 镜像构建检查 -> HTTP 冒烟，随后退出。
-  # 以退出码报告验收结果：
+  # 单次验收服务：代码测试 -> 差分模糊 -> 镜像构建检查 -> HTTP 冒烟
+  # -> 掉电重放（SIGKILL web 容器后校验日志重放 / 尾记录丢弃 / 受损致健康失败），
+  # 随后退出。以退出码报告验收结果：
   #   docker compose up --abort-on-container-exit --exit-code-from verify
   #   docker compose run --rm verify ; echo $?
   verify:
@@ -36,12 +41,18 @@ services:
       PROJECT_ROOT: "/workspace"
       VERIFY_IMAGE_TAG: "mvscc-audit:verify-built"
       DOCKER_SOCK: "/var/run/docker.sock"
+      WEB_CONTAINER: "mvscc-web"
+      JOURNAL_IN_CONTAINER: "/data/frozen.journal"
     volumes:
       # 镜像构建检查直接使用宿主机项目目录作为构建上下文
       - ./:/workspace
-      # 经 Docker Engine API 构建镜像（容器内不装 docker CLI）
+      # 经 Docker Engine API 构建镜像 / 重启 web 容器（容器内不装 docker CLI）
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       web:
         condition: service_healthy
     restart: "no"
+
+volumes:
+  # 冻结审计记录的持久卷：服务重启、容器重建、主机异常断电后均不丢失
+  audit-data:

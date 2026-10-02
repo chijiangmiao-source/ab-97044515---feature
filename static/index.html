@@ -83,7 +83,7 @@
 <body>
 <header>
   <h1>星载参数库 · 多版本事务可串行化审查</h1>
-  <span class="sub">先核验每次读取是否为开始前最新已提交版本，再构造写读 / 写写 / 读写反依赖的多版本串行化图（MVSG）。审计标识一经冻结不可覆盖。</span>
+  <span class="sub">先核验每次读取是否为开始前最新已提交版本，再构造写读 / 写写 / 读写反依赖的多版本串行化图（MVSG）。审计标识一经冻结不可覆盖；冻结记录带校验落盘，服务重启或断电后重放恢复，结论逐字相同。</span>
 </header>
 
 <main>
@@ -480,6 +480,22 @@ async function fetchAudit() {
   if (resp.ok) { replayBadge.style.display = "inline-block"; renderVerdict(body); }
   else { replayBadge.style.display = "none"; renderError(resp.status, body); }
 }
+/* Reopening the console rehydrates the server-side conclusion for the
+   audit id in the box -- including verdicts recovered from the durable
+   journal after a restart. A missing id is simply a blank console. */
+async function rehydrateOnLoad() {
+  const id = document.getElementById("auditId").value.trim();
+  if (!id) return;
+  try {
+    const resp = await fetch(`/api/audits/${encodeURIComponent(id)}`);
+    if (!resp.ok) return;
+    const body = await resp.json();
+    replayBadge.style.display = "inline-block";
+    renderVerdict(body);
+    rawJsonEl.textContent = `REHYDRATE GET /api/audits/${encodeURIComponent(id)}\n` +
+      JSON.stringify(body, null, 2);
+  } catch (_) { /* offline first visit: keep the draft as-is */ }
+}
 document.getElementById("submitBtn").onclick = submitAudit;
 document.getElementById("fetchBtn").onclick = fetchAudit;
 document.getElementById("addInitRow").onclick = () => addInitRow();
@@ -536,8 +552,10 @@ function loadPreset(name) {
 document.querySelectorAll("button[data-preset]").forEach(b =>
   b.onclick = () => loadPreset(b.dataset.preset));
 
-/* 初始载入可串行化预设 */
+/* 初始载入可串行化预设；若该标识已在服务端冻结（含重启后从持久日志
+   恢复的结论），则直接展示恢复后的冻结结论 */
 loadPreset("serial");
+rehydrateOnLoad();
 </script>
 </body>
 </html>

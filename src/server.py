@@ -2,11 +2,18 @@
 
 Endpoints
 ---------
-GET  /healthz                 -> trivial health probe (Compose healthcheck)
+GET  /healthz                 -> health probe (503 when the durable audit
+                                 journal is corrupt; Compose healthcheck)
 GET  /                        -> the audit console page (static/index.html)
-POST /api/audits              -> freeze + analyse a payload
+POST /api/audits              -> freeze + analyse a payload (success only
+                                 after the verdict is durable on disk)
 GET  /api/audits/<audit_id>   -> fetch a frozen verdict
 GET  /api/audits              -> list frozen audit ids
+
+The frozen records live in an append-only checksummed journal whose path
+is taken from ``AUDIT_JOURNAL_PATH``.  When unset the store is purely
+in-memory (used by the in-process tests); the container image sets the
+path to its persistent volume.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from mvscc import PayloadError, build_analysis  # noqa: E402
 from store import ConflictError, FrozenStore  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+DEFAULT_JOURNAL_PATH = os.environ.get("AUDIT_JOURNAL_PATH") or None
 
 
 class AuditHandler(BaseHTTPRequestHandler):
@@ -54,7 +62,16 @@ class AuditHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/healthz":
-            self._send_json(200, {"status": "ok"})
+            healthy, reason = self.server.store.health()
+            if healthy:
+                stats = self.server.store.stats()
+                self._send_json(200, {"status": "ok", "journal": stats})
+            else:
+                # A corrupted *complete* record must fail health loudly:
+                # confirmed audit evidence was damaged and conclusions
+                # cannot be trusted.
+                self._send_json(503, {"status": "unhealthy", "error": "JOURNAL_CORRUPT",
+                                      "message": reason})
             return
         if path == "/api/audits":
             self._send_json(200, {"audit_ids": self.server.store.ids()})
@@ -137,6 +154,16 @@ class AuditHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        except OSError as exc:
+            # The verdict was computed but could not be made durable.
+            # Never report success for a freeze that did not reach disk.
+            sys.stderr.write("journal persistence failure: %r\n" % (exc,))
+            self._send_json(
+                503,
+                {"error": "PERSISTENCE_FAILED",
+                 "message": "audit verdict could not be persisted durably"},
+            )
+            return
 
         self._send_json(
             200 if replayed else 201,
@@ -145,9 +172,15 @@ class AuditHandler(BaseHTTPRequestHandler):
         )
 
 
-def make_server(host: str, port: int) -> ThreadingHTTPServer:
+def make_server(host: str, port: int, journal_path: str | None = DEFAULT_JOURNAL_PATH) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), AuditHandler)
-    server.store = FrozenStore()
+    # Recovery happens synchronously inside FrozenStore: the socket starts
+    # accepting only after valid records have been replayed and any torn
+    # tail has been discarded / corruption flagged.
+    server.store = FrozenStore(journal_path)
+    healthy, reason = server.store.health()
+    if not healthy:
+        sys.stderr.write("WARNING: audit journal recovery reported a problem: %s\n" % reason)
     return server
 
 
@@ -164,6 +197,7 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        server.store.close()
         server.server_close()
     return 0
 

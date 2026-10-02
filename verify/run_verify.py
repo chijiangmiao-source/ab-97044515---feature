@@ -3,11 +3,17 @@
 
 Runs, in order:
 
-  1. code tests            -- unittest suite under /app/verify/tests
-  2. image build check     -- builds the project image through the Docker
-                              Engine API on /var/run/docker.sock (no docker
-                              CLI / pip packages needed)
-  3. HTTP smoke            -- exercises the real web service end to end
+  1. code tests              -- unittest suite under /app/verify/tests
+  2. differential fuzz       -- analyser vs an independent oracle
+  3. image build check       -- builds the project image through the Docker
+                                Engine API on /var/run/docker.sock (no docker
+                                CLI / pip packages needed)
+  4. HTTP smoke              -- exercises the real web service end to end
+  5. durable restart         -- freezes records, hard-kills the web
+                                container (power loss), and verifies the
+                                journal replay: same verdict replay, payload
+                                conflicts, torn-tail discard and explicit
+                                health failure on a corrupted record
 
 Exits 0 only when every check passes; each failing check contributes to a
 non-zero exit code so CI / `docker compose run` observe the verdict.
@@ -22,9 +28,11 @@ import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +41,14 @@ PROJECT_ROOT = os.environ.get("PROJECT_ROOT", "/workspace" if os.path.isdir("/wo
 SOCK_PATH = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 SMOKE_TARGET = os.environ.get("SMOKE_TARGET", "http://web:8080")
 IMAGE_TAG = os.environ.get("VERIFY_IMAGE_TAG", "mvscc-audit:verify-built")
+WEB_CONTAINER = os.environ.get("WEB_CONTAINER", "mvscc-web")
+JOURNAL_IN_CONTAINER = os.environ.get("JOURNAL_IN_CONTAINER", "/data/frozen.journal")
+
+# Reuse the real frame parser so the restart stage counts committed frames
+# exactly the way the service's recovery does.
+sys.path.insert(0, os.path.join(APP_ROOT, "src") if os.path.isdir(
+    os.path.join(APP_ROOT, "src")) else os.path.join(_REPO_ROOT, "src"))
+from store import _parse_frame  # noqa: E402
 
 results = []
 
@@ -55,7 +71,7 @@ def run_code_tests() -> bool:
     suite = loader.discover(os.path.join(APP_ROOT, "verify", "tests"), pattern="test_*.py")
     stream = io.StringIO()
     runner = unittest.TextTestRunner(stream=stream, verbosity=2)
-    print("\n=== 1/4 code tests ===", flush=True)
+    print("\n=== 1/5 code tests ===", flush=True)
     test_result = runner.run(suite)
     print(stream.getvalue())
     ok = test_result.wasSuccessful()
@@ -71,7 +87,7 @@ def run_code_tests() -> bool:
 def run_differential_fuzz() -> bool:
     """Cross-check the analyser against an independent oracle (DFS cycle
     test + exhaustive simple-cycle enumeration on random histories)."""
-    print("\n=== 2/4 differential fuzz ===", flush=True)
+    print("\n=== 2/5 differential fuzz ===", flush=True)
     script = os.path.join(APP_ROOT, "verify", "fuzz_oracle.py")
     try:
         proc = subprocess.run(
@@ -93,11 +109,14 @@ def run_differential_fuzz() -> bool:
 # ---------------------------------------------------------------------------
 
 def _docker_raw_request(method: str, path: str, body: bytes = b"",
-                        content_type: str | None = None, timeout: int = 180) -> tuple[dict, bytes]:
+                        content_type: str | None = None, timeout: int = 180,
+                        extra_headers: list[tuple[str, str]] | None = None) -> tuple[dict, bytes]:
     headers = [f"{method} {path} HTTP/1.1", "Host: docker"]
     if body:
         headers += [f"Content-Type: {content_type or 'application/octet-stream'}",
                     f"Content-Length: {len(body)}"]
+    for key, value in extra_headers or []:
+        headers.append(f"{key}: {value}")
     headers += ["Connection: close", "", ""]
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
@@ -214,7 +233,7 @@ def _dechunk(buf: bytes) -> bytes:
 
 
 def run_image_build_check() -> bool:
-    print("\n=== 3/4 image build check ===", flush=True)
+    print("\n=== 3/5 image build check ===", flush=True)
     dockerfile = os.path.join(PROJECT_ROOT, "Dockerfile")
     if not os.path.exists(SOCK_PATH):
         record("image build check", False, f"Docker socket {SOCK_PATH} not available")
@@ -285,7 +304,7 @@ def http(method, path, body=None):
 
 
 def run_http_smoke() -> bool:
-    print("\n=== 4/4 HTTP smoke ===", flush=True)
+    print("\n=== 4/5 HTTP smoke ===", flush=True)
     all_ok = True
 
     def expect(name, cond, detail=""):
@@ -360,17 +379,319 @@ def run_http_smoke() -> bool:
     return all_ok
 
 
+# ---------------------------------------------------------------------------
+# 4. durable restart acceptance (real container kill + journal replay)
+# ---------------------------------------------------------------------------
+
+ACC_SERIAL = json.loads(json.dumps(SERIAL_PAYLOAD))
+ACC_SERIAL["audit_id"] = "acc-restart-serial"
+ACC_SKEW = json.loads(json.dumps(SKEW_PAYLOAD))
+ACC_SKEW["audit_id"] = "acc-restart-skew"
+ACC_RACE = json.loads(json.dumps(SERIAL_PAYLOAD))
+ACC_RACE["audit_id"] = "acc-restart-race"
+JOURNAL_DIR = os.path.dirname(JOURNAL_IN_CONTAINER)
+JOURNAL_NAME = os.path.basename(JOURNAL_IN_CONTAINER)
+
+
+def _docker_json(method, path, body=None, content_type=None, timeout=60):
+    meta, raw = _docker_raw_request(
+        method, path, body=body or b"", content_type=content_type, timeout=timeout
+    )
+    parsed = None
+    if raw:
+        try:
+            parsed = json.loads(raw.decode(errors="replace"))
+        except json.JSONDecodeError:
+            parsed = None
+    return meta["status"], parsed
+
+
+def _find_web_container():
+    status, containers = _docker_json("GET", "/containers/json?all=1")
+    if status != 200 or not isinstance(containers, list):
+        return None
+    for c in containers:
+        if any(name.lstrip("/") == WEB_CONTAINER for name in c.get("Names", [])):
+            return c["Id"]
+    return None
+
+
+def _container_state(cid):
+    status, info = _docker_json("GET", f"/containers/{cid}/json")
+    if status != 200 or not info:
+        return "unknown"
+    return info.get("State", {}).get("status", "unknown")
+
+
+def _set_restart_policy(cid, name):
+    _docker_json("POST", f"/containers/{cid}/update",
+                 body=json.dumps({"RestartPolicy": {"Name": name}}).encode(),
+                 content_type="application/json")
+
+
+def _kill_container(cid):
+    _docker_json("POST", f"/containers/{cid}/kill")
+    for _ in range(30):
+        if _container_state(cid) in ("exited", "dead", "created"):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _start_container(cid):
+    _docker_json("POST", f"/containers/{cid}/start")
+
+
+def _download_journal(cid):
+    """Pull the journal out of the (stopped) container as raw bytes."""
+    meta, raw = _docker_raw_request(
+        "GET", f"/containers/{cid}/archive?path={urllib.parse.quote(JOURNAL_DIR)}",
+        timeout=60,
+    )
+    if meta["status"] != 200:
+        raise RuntimeError(f"journal download HTTP {meta['status']}: {raw[:200]!r}")
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tar:
+        member = None
+        for m in tar.getmembers():
+            if m.isfile() and os.path.basename(m.name) == JOURNAL_NAME:
+                member = m
+                break
+        if member is None:
+            raise RuntimeError("frozen journal not found in container archive")
+        return tar.extractfile(member).read()
+
+
+def _upload_journal(cid, journal_bytes):
+    """Replace the journal inside the (stopped) container filesystem."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=JOURNAL_NAME)
+        info.size = len(journal_bytes)
+        info.mtime = int(time.time())
+        tar.addfile(info, io.BytesIO(journal_bytes))
+    status, _ = _docker_json(
+        "PUT",
+        f"/containers/{cid}/archive?path={urllib.parse.quote(JOURNAL_DIR)}"
+        "&noOverwriteDirNonDir=false",
+        body=buf.getvalue(), content_type="application/x-tar", timeout=60,
+    )
+    if status not in (200, 201):
+        raise RuntimeError(f"journal upload HTTP {status}")
+
+
+def _wait_web_health(expected=200, attempts=30):
+    last = None
+    for _ in range(attempts):
+        try:
+            status, _, body = http("GET", "/healthz")
+            last = (status, body)
+            if status == expected:
+                return status, body
+        except (urllib.error.URLError, ConnectionError, json.JSONDecodeError) as exc:
+            last = ("unreachable", repr(exc))
+        time.sleep(1)
+    return None if last is None else last
+
+
+def _torn_tail_bytes(good_bytes):
+    """A half-written trailing frame: checksummed body present, END absent."""
+    return good_bytes + b"F1\nLEN 120\n{\"audit_id\": \"acc-torn-tail\", \"partial\": true"
+
+
+def _corrupt_last_committed_frame(good_bytes):
+    """Flip one byte inside the last committed frame's JSON body.
+
+    Its ``END\\n`` marker is preserved, so recovery must classify this as
+    a corrupted *complete* record (checksum mismatch), not a torn write.
+    """
+    last_magic = good_bytes.rfind(b"F1\n")
+    body_start = good_bytes.find(b"{", last_magic)
+    if body_start == -1:
+        raise RuntimeError("no JSON body found in last journal frame")
+    flipped = (good_bytes[body_start] ^ 0x01).to_bytes(1, "little")
+    return good_bytes[:body_start] + flipped + good_bytes[body_start + 1:]
+
+
+def run_durable_restart_acceptance() -> bool:
+    print("\n=== 5/5 durable restart acceptance (power-loss replay) ===", flush=True)
+    all_ok = True
+
+    def expect(name, cond, detail=""):
+        nonlocal all_ok
+        record(name, cond, detail)
+        all_ok = all_ok and cond
+
+    if not os.path.exists(SOCK_PATH):
+        expect("docker daemon available for restart test", False,
+               f"{SOCK_PATH} missing")
+        return False
+
+    cid = _find_web_container()
+    expect("locate running web container", cid is not None, WEB_CONTAINER)
+    if not cid:
+        return False
+
+    # ---- freeze records through the real HTTP API ---------------------
+    status, _, created = http("POST", "/api/audits", ACC_SERIAL)
+    expect("created record freezes (201)", status == 201,
+           f"POST -> {status}")
+    status, headers, replayed = http("POST", "/api/audits", ACC_SERIAL)
+    expect("conflict-free retransmission replays (200)",
+           status == 200 and headers.get("X-Audit-Replayed") == "true"
+           and replayed == created, f"POST replay -> {status}")
+    changed = json.loads(json.dumps(ACC_SERIAL))
+    changed["initial"]["x"] = 777
+    status, _, body = http("POST", "/api/audits", changed)
+    expect("changed payload under same id conflicts (409)",
+           status == 409 and body and body["error"] == "AUDIT_ID_CONFLICT",
+           f"POST changed -> {status}")
+    status, _, skew_created = http("POST", "/api/audits", ACC_SKEW)
+    expect("cycle evidence record freezes (201)",
+           status == 201 and skew_created
+           and skew_created.get("status") == "NOT_SERIALIZABLE",
+           f"POST skew -> {status}")
+
+    # ---- concurrent identical submissions must freeze exactly once ----
+    race_statuses = []
+    race_lock = threading.Lock()
+
+    def post_race():
+        req = urllib.request.Request(
+            SMOKE_TARGET + "/api/audits",
+            data=json.dumps(ACC_RACE).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                code = resp.status
+        except urllib.error.HTTPError as exc:  # pragma: no cover
+            code = exc.code
+        with race_lock:
+            race_statuses.append(code)
+
+    threads = [threading.Thread(target=post_race) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    expect("concurrent identical posts: exactly one 201, rest replay 200",
+           race_statuses.count(201) == 1 and race_statuses.count(200) == 7,
+           str(sorted(race_statuses)))
+
+    # ---- hard kill + torn tail + restart -------------------------------
+    good_bytes = None
+    try:
+        _set_restart_policy(cid, "no")
+        killed = _kill_container(cid)
+        expect("SIGKILL web container (simulated power loss)", killed,
+               f"state={_container_state(cid)}")
+        good_bytes = _download_journal(cid)
+
+        def frame_ids(blob):
+            ids, pos = [], 0
+            while True:
+                record, next_pos, _reason, _complete = _parse_frame(blob, pos)
+                if record is None:
+                    break
+                ids.append(record["audit_id"])
+                pos = next_pos
+            return ids
+
+        frozen_ids = frame_ids(good_bytes)
+        unique_ids = set(frozen_ids)
+        expect("journal holds one committed frame per distinct freeze",
+               len(frozen_ids) == len(unique_ids)
+               and {"acc-restart-serial", "acc-restart-skew", "acc-restart-race"}
+               <= unique_ids,
+               f"frames={frozen_ids}")
+
+        _upload_journal(cid, _torn_tail_bytes(good_bytes))
+        _start_container(cid)
+        got = _wait_web_health(200)
+        expect("service healthy after discarding torn tail",
+               bool(got) and got[0] == 200, str(got)[:160])
+
+        status, _, body = http("GET", "/api/audits/acc-torn-tail")
+        expect("torn tail never forms a readable conclusion",
+               status == 404, f"GET torn -> {status}")
+        status, _, body = http("GET", "/api/audits/acc-restart-serial")
+        expect("recovered serial conclusion is intact",
+               status == 200 and body == created, f"GET -> {status}")
+        status, _, body = http("GET", "/api/audits/acc-restart-skew")
+        expect("recovered cycle conclusion is intact",
+               status == 200 and body == skew_created, f"GET -> {status}")
+        status, headers, body = http("POST", "/api/audits", ACC_SERIAL)
+        expect("same id+payload replays original after restart",
+               status == 200 and headers.get("X-Audit-Replayed") == "true"
+               and body == created, f"POST replay -> {status}")
+        status, _, body = http("POST", "/api/audits", changed)
+        expect("changed payload still conflicts after restart",
+               status == 409 and body["error"] == "AUDIT_ID_CONFLICT",
+               f"POST changed -> {status}")
+
+        # ---- hard kill + corrupted *committed* record + restart --------
+        if not _kill_container(cid):
+            expect("SIGKILL before corruption injection", False,
+                   f"state={_container_state(cid)}")
+        else:
+            _upload_journal(cid, _corrupt_last_committed_frame(good_bytes))
+            _start_container(cid)
+            got = _wait_web_health(503)
+            expect("corrupted complete record fails health explicitly",
+                   bool(got) and got[0] == 503
+                   and isinstance(got[1], dict)
+                   and got[1].get("error") == "JOURNAL_CORRUPT",
+                   str(got)[:200])
+            # undamaged prefix is still readable
+            status, _, body = http("GET", "/api/audits/acc-restart-serial")
+            expect("undamaged prefix still served while unhealthy",
+                   status == 200 and body == created, f"GET -> {status}")
+
+            # ---- restore a clean journal so the environment is left ok -
+            _kill_container(cid)
+            _upload_journal(cid, good_bytes)
+            _start_container(cid)
+            got = _wait_web_health(200)
+            expect("health restored after clean journal reinstated",
+                   bool(got) and got[0] == 200, str(got)[:160])
+    except Exception as exc:  # noqa: BLE001 - acceptance reports the failure
+        expect("durable restart stage completed without tooling error",
+               False, repr(exc))
+    finally:
+        # Never leave the shared web container stopped, unhealthy, or
+        # holding a deliberately corrupted journal: reinstate the pristine
+        # copy captured before any damage was injected.
+        try:
+            if good_bytes is not None:
+                if _container_state(cid) == "running":
+                    _kill_container(cid)
+                try:
+                    _upload_journal(cid, good_bytes)
+                except Exception:  # noqa: BLE001
+                    pass
+                if _container_state(cid) != "running":
+                    _start_container(cid)
+            elif _container_state(cid) != "running":
+                _start_container(cid)
+            _set_restart_policy(cid, "unless-stopped")
+        except Exception:  # noqa: BLE001
+            pass
+        _wait_web_health(200, attempts=15)
+
+    return all_ok
+
+
 def main() -> int:
     print(f"mvscc verify: target={SMOKE_TARGET} project={PROJECT_ROOT}", flush=True)
     ok_tests = run_code_tests()
     ok_fuzz = run_differential_fuzz()
     ok_image = run_image_build_check()
     ok_smoke = run_http_smoke()
+    ok_restart = run_durable_restart_acceptance()
 
     print("\n=== acceptance summary ===")
     for name, ok, _ in results:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}")
-    code = 0 if (ok_tests and ok_fuzz and ok_image and ok_smoke) else 1
+    code = 0 if (ok_tests and ok_fuzz and ok_image and ok_smoke and ok_restart) else 1
     print(f"\nverify exit code: {code}")
     return code
 
