@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星载参数库 · 多版本串行化审查</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --panel2: #1d2638; --line: #2b3650;
+    --text: #e6ebf5; --muted: #93a0b8; --accent: #5b8cff;
+    --ok: #2fbf71; --bad: #ff5d6c; --warn: #f0b429;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex;
+    align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12.5px; }
+  main { display:grid; grid-template-columns: minmax(420px, 1fr) minmax(460px, 1.15fr);
+    gap:18px; padding:18px 24px; align-items:start; }
+  @media (max-width: 1020px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:16px; }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--accent);
+    text-transform:uppercase; letter-spacing:.08em; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  input[type=text], input[type=number], select, textarea {
+    width:100%; background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+    color:var(--text); padding:6px 8px; font-size:13px; font-family:inherit; }
+  textarea { min-height:150px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:6px 12px; font-size:12.5px; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:#fff; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff;
+    font-weight:600; padding:8px 20px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row > * { flex:1; }
+  .row .narrow { flex:0 0 70px; }
+  .row .tiny { flex:0 0 42px; }
+  .kvrow { display:grid; grid-template-columns: 1fr 1fr 34px; gap:6px; margin-bottom:6px; }
+  .txn { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px;
+    background:var(--panel2); }
+  .txn-head { display:grid; grid-template-columns: 1fr 110px 110px 34px; gap:6px; align-items:center; }
+  .txn-head label { margin:0; }
+  .step { border-left:3px solid var(--line); padding:6px 8px; margin:8px 0 8px 6px;
+    background:var(--bg); border-radius:0 6px 6px 0; }
+  .step.rw { border-left-color:var(--warn); }
+  .step.wr { border-left-color:var(--accent); }
+  .step-grid { display:grid; grid-template-columns: 58px 1fr 1fr 1fr 28px 28px; gap:6px; align-items:center; }
+  .step-grid .op-tag { font-size:11px; color:var(--muted); }
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .presets button { font-size:12px; }
+  .verdict { border-radius:10px; border:1px solid var(--line); padding:14px 16px;
+    margin-bottom:14px; }
+  .verdict.serializable { border-color:var(--ok); background:rgba(47,191,113,.08); }
+  .verdict.notserializable { border-color:var(--bad); background:rgba(255,93,108,.08); }
+  .verdict.invalid, .verdict.error { border-color:var(--warn); background:rgba(240,180,41,.08); }
+  .verdict h3 { margin:0 0 4px; font-size:15px; }
+  .badge { display:inline-block; font-size:11px; padding:1px 8px; border-radius:20px;
+    border:1px solid var(--line); color:var(--muted); margin-left:8px; vertical-align:middle; }
+  table { width:100%; border-collapse:collapse; margin:8px 0; font-size:12.5px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line);
+    vertical-align:top; word-break:break-word; }
+  th { color:var(--muted); font-weight:500; font-size:11.5px; text-transform:uppercase; }
+  td code, p code, .chip { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .chip { display:inline-block; background:var(--panel2); border:1px solid var(--line);
+    border-radius:20px; padding:2px 12px; margin:2px 4px 2px 0; }
+  .chip .arrow { color:var(--muted); margin:0 4px; }
+  .edge-type { font-family:ui-monospace,Menlo,Consolas,monospace; font-weight:700; }
+  .edge-type.ww { color:var(--accent); } .edge-type.wr { color:var(--ok); }
+  .edge-type.rw { color:var(--bad); }
+  .muted { color:var(--muted); }
+  .stale-note { font-size:12px; color:var(--muted); margin-top:6px; }
+  details { margin-top:10px; }
+  summary { cursor:pointer; color:var(--muted); font-size:12.5px; }
+  .del { color:var(--bad); padding:4px 0; text-align:center; }
+  h4 { margin:14px 0 6px; font-size:13px; color:var(--text); }
+  .final-state { background:var(--panel2); border-radius:6px; padding:8px 10px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>星载参数库 · 多版本事务可串行化审查</h1>
+  <span class="sub">先核验每次读取是否为开始前最新已提交版本，再构造写读 / 写写 / 读写反依赖的多版本串行化图（MVSG）。审计标识一经冻结不可覆盖。</span>
+</header>
+
+<main>
+  <!-- ============================ 草稿编辑 ============================ -->
+  <section class="panel" id="editor">
+    <h2>审计载荷草稿</h2>
+
+    <label>稳定审计标识 audit_id</label>
+    <input type="text" id="auditId" placeholder="例如：orbit-2026-09-30-batch-07" value="audit-demo">
+
+    <label>初始键值 initial（值按 JSON 标量解析：数字 / 字符串 / true / false / null）</label>
+    <div id="initialRows"></div>
+    <div class="toolbar"><button type="button" id="addInitRow">＋ 初始键</button></div>
+
+    <label style="margin-top:16px">事务（至多 24 个；步骤按真实发生顺序排列）</label>
+    <div id="txnList"></div>
+    <div class="toolbar">
+      <button type="button" id="addTxn">＋ 事务</button>
+      <span class="muted" style="align-self:center">已添加 <b id="txnCount">0</b> / 24</span>
+    </div>
+
+    <div class="toolbar presets" style="margin-top:18px; border-top:1px solid var(--line); padding-top:12px">
+      <span class="muted" style="align-self:center">载入场景：</span>
+      <button type="button" data-preset="stale">① 读到过期版本（INVALID_READ）</button>
+      <button type="button" data-preset="skew">② 写偏差反例环（NOT_SERIALIZABLE）</button>
+      <button type="button" data-preset="serial">③ 可串行历史（SERIALIZABLE）</button>
+    </div>
+    <p class="stale-note">任何草稿修改都会立即清除当前页面展示的旧结论；冻结结论以服务端记录为准，重放不会重新计算。</p>
+
+    <div class="toolbar" style="margin-top:14px">
+      <button type="button" class="primary" id="submitBtn">提交至真实接口 /api/audits</button>
+      <button type="button" id="fetchBtn">按标识取回冻结结论</button>
+    </div>
+  </section>
+
+  <!-- ============================ 冻结结论 ============================ -->
+  <section class="panel">
+    <h2>冻结结论 <span id="replayBadge" class="badge" style="display:none">原结论回放</span></h2>
+    <div id="verdict"><p class="muted">尚无结论。提交载荷后，此处将显示版本核验与 MVSG 裁决。</p></div>
+    <details>
+      <summary>本次请求 / 响应原文</summary>
+      <pre id="rawJson" class="final-state" style="white-space:pre-wrap; margin-top:8px"></pre>
+    </details>
+  </section>
+</main>
+
+<script>
+"use strict";
+/* ------------------------------------------------------------------ */
+/* 草稿模型：直接以 DOM 为数据源，提交时序列化为服务端 JSON              */
+/* ------------------------------------------------------------------ */
+const MAX_TXN = 24;
+const initialRows = document.getElementById("initialRows");
+const txnList = document.getElementById("txnList");
+const verdictEl = document.getElementById("verdict");
+const rawJsonEl = document.getElementById("rawJson");
+const replayBadge = document.getElementById("replayBadge");
+
+function parseScalar(text) {
+  const t = text.trim();
+  if (t === "") return "";
+  try { return JSON.parse(t); }
+  catch (_) { return t; }           // 非 JSON 时按裸字符串处理
+}
+function scalarToText(v) {
+  if (typeof v === "string") return v;
+  return JSON.stringify(v);
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+/* ---------------- 初始键值 ---------------- */
+function addInitRow(key = "", value = "") {
+  const row = el("div", "kvrow");
+  const k = el("input"); k.type = "text"; k.placeholder = "参数键 key"; k.value = key;
+  const v = el("input"); v.type = "text"; v.placeholder = "初始值（JSON 标量）";
+  v.value = value === "" ? "" : scalarToText(value);
+  const del = el("button", "del", "×"); del.type = "button"; del.title = "删除";
+  del.onclick = () => { row.remove(); markDirty(); };
+  row.append(k, v, del);
+  initialRows.appendChild(row);
+}
+
+/* ---------------- 事务 ---------------- */
+function allTxnIds(except) {
+  return [...txnList.querySelectorAll(".txn")]
+    .map(n => n.querySelector(".txn-id").value)
+    .filter(id => id && id !== except);
+}
+function refreshWriterOptions() {
+  const ids = [...txnList.querySelectorAll(".txn")].map(n => n.querySelector(".txn-id").value);
+  txnList.querySelectorAll("select.writer-select").forEach(sel => {
+    const owner = sel.closest(".txn").querySelector(".txn-id").value;
+    const cur = sel.value;
+    sel.innerHTML = "";
+    ids.forEach(id => {
+      if (id && id !== owner) sel.append(new Option(id, id));
+    });
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  });
+}
+
+function addStep(container, spec) {
+  const s = spec || { op: "read" };
+  const wrap = el("div", "step " + (s.op === "read" ? "rw" : "wr"));
+  const grid = el("div", "step-grid");
+
+  const tag = el("span", "op-tag", s.op === "read" ? "读 R" : "写 W");
+
+  const keyIn = el("input"); keyIn.type = "text"; keyIn.placeholder = "键"; keyIn.value = s.key || "";
+
+  const opSel = el("select"); opSel.className = "narrow";
+  opSel.append(new Option("读 read", "read"), new Option("写 write", "write"));
+  opSel.value = s.op;
+
+  const obsWrap = el("div");
+  const buildObs = () => {
+    obsWrap.innerHTML = "";
+    if (opSel.value === "write") {
+      const wi = el("input"); wi.type = "text"; wi.placeholder = "写入值（JSON 标量）";
+      wi.className = "write-value";
+      wi.value = s.value !== undefined ? scalarToText(s.value) : "";
+      obsWrap.appendChild(wi);
+      wi.addEventListener("input", markDirty);
+    } else {
+      const obs = el("select"); obs.className = "obs-kind";
+      obs.append(new Option("观察=初始版本", "initial"));
+      obs.append(new Option("观察=初始字面值", "literal"));
+      obs.append(new Option("观察=某事务写入", "txn"));
+      const lit = el("input"); lit.type = "text"; lit.placeholder = "读到的字面值";
+      lit.className = "obs-literal";
+      const wr = el("select"); wr.className = "writer-select";
+      const owner = wrap.closest(".txn").querySelector(".txn-id").value;
+      allTxnIds(owner).forEach(id => wr.append(new Option(id, id)));
+
+      const cur = s.observed;
+      if (cur && typeof cur === "object") { obs.value = "txn"; wr.value = cur.writer || ""; }
+      else if (cur !== undefined && cur !== "initial") { obs.value = "literal"; lit.value = scalarToText(cur); }
+      else { obs.value = "initial"; }
+
+      const render = () => {
+        obsWrap.innerHTML = "";
+        obsWrap.append(obs);
+        if (obs.value === "literal") obsWrap.append(lit);
+        if (obs.value === "txn") obsWrap.append(wr);
+      };
+      obs.addEventListener("change", () => { render(); markDirty(); });
+      lit.addEventListener("input", markDirty);
+      wr.addEventListener("change", markDirty);
+      render();
+    }
+  };
+  opSel.addEventListener("change", () => {
+    s.op = opSel.value;
+    wrap.className = "step " + (s.op === "read" ? "rw" : "wr");
+    tag.textContent = s.op === "read" ? "读 R" : "写 W";
+    if (s.op === "write") { delete s.observed; s.value = ""; }
+    else { delete s.value; s.observed = "initial"; }
+    buildObs();
+    markDirty();
+  });
+  keyIn.addEventListener("input", markDirty);
+
+  const up = el("button", "tiny", "↑"); up.type = "button"; up.title = "上移";
+  const down = el("button", "tiny", "↓"); down.type = "button"; down.title = "下移";
+  up.onclick = () => { if (wrap.previousElementSibling) { container.insertBefore(wrap, wrap.previousElementSibling); markDirty(); } };
+  down.onclick = () => { if (wrap.nextElementSibling) { container.insertBefore(wrap.nextElementSibling, wrap); markDirty(); } };
+  const del = el("button", "tiny del", "×"); del.type = "button"; del.title = "删除步骤";
+  del.onclick = () => { wrap.remove(); markDirty(); };
+
+  /* grid child indices are fixed: 0 tag, 1 key, 2 op, 3 observation, 4 up, 5 down, 6 del */
+  grid.style.gridTemplateColumns = "44px 1fr 96px 1.4fr 26px 26px 26px";
+  grid.append(tag, keyIn, opSel, obsWrap, up, down, del);
+  wrap.appendChild(grid);
+  container.appendChild(wrap);
+  /* populate observation controls only after attachment: closest(".txn")
+     needs the step node to live inside its transaction box */
+  buildObs();
+  refreshWriterOptions();
+}
+
+function addTxn(spec) {
+  if (txnList.children.length >= MAX_TXN) return;
+  const t = spec || { id: "", start: 0, commit: 0, steps: [] };
+  const box = el("div", "txn");
+  const head = el("div", "txn-head");
+  const idIn = el("input"); idIn.type = "text"; idIn.placeholder = "事务标识 T?";
+  idIn.className = "txn-id"; idIn.value = t.id || "";
+  const stIn = el("input"); stIn.type = "number"; stIn.className = "txn-start";
+  stIn.value = t.start !== undefined ? t.start : 0; stIn.step = "any";
+  const cmIn = el("input"); cmIn.type = "number"; cmIn.className = "txn-commit";
+  cmIn.value = t.commit !== undefined ? t.commit : 0; cmIn.step = "any";
+  const del = el("button", "del", "×"); del.type = "button";
+  del.onclick = () => { box.remove(); refreshWriterOptions(); updateCount(); markDirty(); };
+  const idLab = el("label", null, "标识"); const wrap1 = el("div"); wrap1.append(idLab, idIn);
+  const stLab = el("label", null, "开始 start"); const wrap2 = el("div"); wrap2.append(stLab, stIn);
+  const cmLab = el("label", null, "提交 commit"); const wrap3 = el("div"); wrap3.append(cmLab, cmIn);
+  head.append(wrap1, wrap2, wrap3, del);
+  box.append(head);
+
+  const stepsBox = el("div", "steps");
+  box.append(stepsBox);
+  const addStepBtn = el("button", null, "＋ 步骤"); addStepBtn.type = "button";
+  addStepBtn.style.marginTop = "6px";
+  addStepBtn.onclick = () => addStep(stepsBox);
+  box.append(addStepBtn);
+
+  idIn.addEventListener("input", () => { refreshWriterOptions(); markDirty(); });
+  stIn.addEventListener("input", markDirty);
+  cmIn.addEventListener("input", markDirty);
+
+  txnList.appendChild(box);
+  (t.steps || []).forEach(sp => addStep(stepsBox, sp));
+  updateCount();
+}
+function updateCount() { document.getElementById("txnCount").textContent = txnList.children.length; }
+
+/* ------------------------------------------------------------------ */
+/* 序列化                                                              */
+/* ------------------------------------------------------------------ */
+function serializePayload() {
+  const initial = {};
+  initialRows.querySelectorAll(".kvrow").forEach(row => {
+    const k = row.children[0].value.trim();
+    if (k) initial[k] = parseScalar(row.children[1].value);
+  });
+  const transactions = [...txnList.querySelectorAll(".txn")].map(box => {
+    const steps = [...box.querySelector(".steps").children].map(wrap => {
+      const g = wrap.querySelector(".step-grid");
+      const key = g.children[1].value.trim();
+      const op = g.children[2].value;
+      if (op === "write") {
+        return { op: "write", key, value: parseScalar(wrap.querySelector(".write-value").value) };
+      }
+      const kind = wrap.querySelector(".obs-kind").value;
+      if (kind === "txn") {
+        return { op: "read", key, observed: { source: "txn", writer: wrap.querySelector(".writer-select").value } };
+      }
+      if (kind === "literal") {
+        return { op: "read", key, observed: parseScalar(wrap.querySelector(".obs-literal").value) };
+      }
+      return { op: "read", key, observed: "initial" };
+    });
+    return {
+      id: box.querySelector(".txn-id").value.trim(),
+      start: Number(box.querySelector(".txn-start").value),
+      commit: Number(box.querySelector(".txn-commit").value),
+      steps,
+    };
+  });
+  return { audit_id: document.getElementById("auditId").value.trim(), initial, transactions };
+}
+
+/* ------------------------------------------------------------------ */
+/* 旧证据清除：草稿上的任何 input/change 都会清空结论                    */
+/* ------------------------------------------------------------------ */
+let dirty = false;
+function markDirty() {
+  dirty = true;
+  replayBadge.style.display = "none";
+  verdictEl.innerHTML = '<p class="muted">草稿已修改，旧证据已清除。重新提交以获得新的冻结结论。</p>';
+  rawJsonEl.textContent = "";
+}
+document.getElementById("editor").addEventListener("input", () => { if (!dirty) markDirty(); });
+document.getElementById("auditId").addEventListener("input", markDirty);
+
+/* ------------------------------------------------------------------ */
+/* 结论渲染                                                            */
+/* ------------------------------------------------------------------ */
+function edgeTypeBadge(t) {
+  return `<span class="edge-type ${t}">${t}</span>`;
+}
+function edgesTable(edges) {
+  if (!edges || !edges.length) return '<p class="muted">图中无边。</p>';
+  return `<table><thead><tr><th>边</th><th>类型</th><th>键</th><th>步骤 (from→to)</th><th>版本依据</th></tr></thead><tbody>${
+    edges.map(e => `<tr>
+      <td><code>${esc(e.from)} → ${esc(e.to)}</code></td>
+      <td>${edgeTypeBadge(e.type)}</td>
+      <td><code>${esc(e.key)}</code></td>
+      <td>${e.from_step} → ${e.to_step}</td>
+      <td>${esc(e.reason)}</td></tr>`).join("")
+  }</tbody></table>`;
+}
+function readChecksTable(checks, onlyInvalid) {
+  const rows = onlyInvalid ? checks : checks;
+  return `<table><thead><tr><th>事务</th><th>步骤</th><th>键</th><th>应为（开始前最新版本）</th><th>实际声明</th></tr></thead><tbody>${
+    rows.map(c => `<tr${onlyInvalid ? ' style="color:var(--warn)"' : ""}>
+      <td><code>${esc(c.transaction)}</code></td><td>${c.step}</td><td><code>${esc(c.key)}</code></td>
+      <td>写入者 <code>${esc(c.expected_writer)}</code>，值 <code>${esc(JSON.stringify(c.expected_value))}</code></td>
+      <td>写入者 <code>${esc(c.observed_writer)}</code>${c.observed_value !== undefined ? `，值 <code>${esc(JSON.stringify(c.observed_value))}</code>` : ""}${c.note ? `<br><span class="muted">${esc(c.note)}</span>` : ""}</td>
+    </tr>`).join("")
+  }</tbody></table>`;
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+}
+
+function renderVerdict(v) {
+  dirty = false;
+  let html = "";
+  if (v.status === "SERIALIZABLE") {
+    const chain = v.serial_order.map((id, i) =>
+      `<span class="chip">${esc(id)}</span>${i < v.serial_order.length - 1 ? '<span class="arrow">→</span>' : ""}`).join("");
+    const recomp = v.recomputation || {};
+    const reads = Object.entries(recomp.reads_in_order || {}).map(([tid, rs]) =>
+      `<tr><td><code>${esc(tid)}</code></td><td>${
+        rs.length ? rs.map(r => `#${r.step} 读 <code>${esc(r.key)}</code> = <code>${esc(JSON.stringify(r.value))}</code>`).join("<br>")
+                  : '<span class="muted">无读步骤</span>'}</td></tr>`).join("");
+    html = `<div class="verdict serializable">
+      <h3>✓ 图无环 · 历史可串行化</h3>
+      <p>按事务标识稳定裁决的串行顺序：</p>
+      <p>${chain}</p>
+      <h4>按该顺序逐读复算</h4>
+      <table><thead><tr><th>串行顺序中的事务</th><th>每步读到的值</th></tr></thead><tbody>${reads}</tbody></table>
+      <h4>复算最终键值</h4>
+      <div class="final-state">${esc(JSON.stringify(recomp.final_state, null, 2))}</div>
+    </div>
+    <details open><summary>每次读取的版本核验（全部通过）</summary>${readChecksTable(v.read_checks)}</details>
+    <details><summary>MVSG 全部边（${v.edges.length}）</summary>${edgesTable(v.edges)}</details>`;
+  } else if (v.status === "NOT_SERIALIZABLE") {
+    const c = v.cycle;
+    html = `<div class="verdict notserializable">
+      <h3>✗ 存在闭环 · 写偏差类规范反例，历史不可串行化</h3>
+      <p>最少边数闭环（${c.length} 边；同长度下取按事务标识序最小者）：<br>
+      <b style="font-family:ui-monospace,Menlo,Consolas,monospace">${esc(c.reason)}</b></p>
+      <h4>逐边依据</h4>${edgesTable(c.edges)}
+    </div>
+    <details><summary>每次读取的版本核验（快照本身均合法，冲突来自跨事务反依赖）</summary>${readChecksTable(v.read_checks)}</details>
+    <details><summary>MVSG 全部边（${v.edges.length}）</summary>${edgesTable(v.edges)}</details>`;
+  } else if (v.status === "INVALID_READ") {
+    html = `<div class="verdict invalid">
+      <h3>⚠ 输入错误：存在读到过期 / 不可能版本的读取</h3>
+      <p>以下读取未取其事务开始时刻之前最新的已提交版本，故不进入串行化图裁决：</p>
+      ${readChecksTable(v.invalid_reads, true)}
+    </div>
+    <details><summary>全部读取核验明细</summary>${readChecksTable(v.read_checks)}</details>`;
+  } else {
+    html = `<div class="verdict error"><h3>服务端返回未知状态</h3><pre class="final-state">${esc(JSON.stringify(v, null, 2))}</pre></div>`;
+  }
+  verdictEl.innerHTML = html;
+}
+function renderError(status, body) {
+  dirty = false;
+  const frozen = body && body.error === "AUDIT_ID_CONFLICT";
+  verdictEl.innerHTML = `<div class="verdict ${frozen ? "notserializable" : "error"}">
+    <h3>${frozen ? "⛔ 审计标识已被不同载荷冻结" : `请求失败（HTTP ${status}）`}</h3>
+    <p>${esc(body && body.message || JSON.stringify(body))}</p>
+    ${body && body.audit_id ? `<p class="muted">冲突标识：<code>${esc(body.audit_id)}</code>——已冻结记录未被覆盖，请改用新标识或原样重传。</p>` : ""}
+  </div>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* 提交 / 取回                                                         */
+/* ------------------------------------------------------------------ */
+async function submitAudit() {
+  const payload = serializePayload();
+  rawJsonEl.textContent = "REQUEST POST /api/audits\n" + JSON.stringify(payload, null, 2);
+  let resp;
+  try {
+    resp = await fetch("/api/audits", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    renderError(0, { message: "无法连接服务：" + e });
+    return;
+  }
+  const body = await resp.json();
+  rawJsonEl.textContent += `\n\nRESPONSE ${resp.status} (X-Audit-Replayed: ${resp.headers.get("X-Audit-Replayed")})\n` + JSON.stringify(body, null, 2);
+  if (resp.ok) {
+    replayBadge.style.display = resp.headers.get("X-Audit-Replayed") === "true" ? "inline-block" : "none";
+    renderVerdict(body);
+  } else if (resp.status === 422 && body && body.verdict) {
+    // 读到过期版本：确定性的输入错误诊断，不冻结
+    replayBadge.style.display = "none";
+    renderVerdict(body.verdict);
+  } else {
+    replayBadge.style.display = "none";
+    renderError(resp.status, body);
+  }
+}
+async function fetchAudit() {
+  const id = encodeURIComponent(document.getElementById("auditId").value.trim());
+  if (!id) { renderError(400, { message: "请先填写审计标识" }); return; }
+  rawJsonEl.textContent = `REQUEST GET /api/audits/${id}`;
+  const resp = await fetch(`/api/audits/${id}`);
+  const body = await resp.json();
+  rawJsonEl.textContent += `\n\nRESPONSE ${resp.status}\n` + JSON.stringify(body, null, 2);
+  if (resp.ok) { replayBadge.style.display = "inline-block"; renderVerdict(body); }
+  else { replayBadge.style.display = "none"; renderError(resp.status, body); }
+}
+document.getElementById("submitBtn").onclick = submitAudit;
+document.getElementById("fetchBtn").onclick = fetchAudit;
+document.getElementById("addInitRow").onclick = () => addInitRow();
+document.getElementById("addTxn").onclick = () => addTxn();
+
+/* ------------------------------------------------------------------ */
+/* 预设                                                                */
+/* ------------------------------------------------------------------ */
+const PRESETS = {
+  stale: {
+    audit_id: "case-stale-read",
+    initial: { x: 0 },
+    transactions: [
+      { id: "T1", start: 1, commit: 5, steps: [{ op: "write", key: "x", value: 10 }] },
+      { id: "T2", start: 6, commit: 8, steps: [{ op: "read", key: "x", observed: "initial" }] },
+    ],
+  },
+  skew: {
+    audit_id: "case-write-skew",
+    initial: { x: 100, y: 100 },
+    transactions: [
+      { id: "T1", start: 1, commit: 5, steps: [
+        { op: "read", key: "x", observed: "initial" },
+        { op: "write", key: "y", value: -100 } ] },
+      { id: "T2", start: 2, commit: 6, steps: [
+        { op: "read", key: "y", observed: "initial" },
+        { op: "write", key: "x", value: -100 } ] },
+    ],
+  },
+  serial: {
+    audit_id: "case-serializable",
+    initial: { x: 1 },
+    transactions: [
+      { id: "T1", start: 1, commit: 3, steps: [{ op: "write", key: "x", value: 2 }] },
+      { id: "T2", start: 4, commit: 6, steps: [
+        { op: "read", key: "x", observed: { source: "txn", writer: "T1" } },
+        { op: "write", key: "x", value: 3 } ] },
+      { id: "T3", start: 7, commit: 9, steps: [
+        { op: "read", key: "x", observed: { source: "txn", writer: "T2" } } ] },
+    ],
+  },
+};
+function loadPreset(name) {
+  const p = PRESETS[name];
+  document.getElementById("auditId").value = p.audit_id;
+  initialRows.innerHTML = "";
+  Object.entries(p.initial).forEach(([k, v]) => addInitRow(k, v));
+  txnList.innerHTML = "";
+  p.transactions.forEach(t => addTxn(t));
+  updateCount();
+  markDirty();
+  verdictEl.innerHTML = '<p class="muted">预设已载入，点击“提交至真实接口”获得冻结结论。</p>';
+}
+document.querySelectorAll("button[data-preset]").forEach(b =>
+  b.onclick = () => loadPreset(b.dataset.preset));
+
+/* 初始载入可串行化预设 */
+loadPreset("serial");
+</script>
+</body>
+</html>
